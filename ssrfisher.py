@@ -9,6 +9,8 @@
 # - Pretty Rich console logs + clean JSONL file logging
 # - HTTPS with auto-signed certs (--ssl) or provided cert/key
 # - Mimic real servers + optional open CORS
+# - Copy-friendly body output (--detach-body) (prints raw to stdout, no Rich truncation)
+# - Unlimited body preview with 0 (console + JSONL)
 
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import os
 import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -36,10 +39,11 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich.syntax import Syntax
+    from rich.rule import Rule
 except ImportError:
     raise SystemExit("Missing dependency: rich\nInstall with: pip install rich\n")
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.0.1"
 SLOGAN = "Hook requests. Reel logs."
 AUTHOR_TAG = "@Gromak123"
 
@@ -146,13 +150,18 @@ def merge_headers(base: list[tuple[str, str]], override: list[tuple[str, str]]) 
 def pretty_body(body: bytes, content_type: str, maxn: int) -> tuple[str, str, bool]:
     """
     Return (lang, rendered_str, truncated_bool) for console display.
-    lang: 'json' or 'text'
+    maxn == 0 means unlimited.
     """
     if not body:
         return "text", "", False
 
-    truncated = len(body) > maxn
-    shown = body[:maxn]
+    if maxn <= 0:
+        shown = body
+        truncated = False
+    else:
+        truncated = len(body) > maxn
+        shown = body[:maxn]
+
     ct = (content_type or "").lower()
 
     if "application/json" in ct:
@@ -180,6 +189,12 @@ def sanitize_header_value(value: str, arg_name: str) -> str:
     if any(c in value for c in ("\r", "\n")):
         raise SystemExit(f"{arg_name}: invalid value (CR/LF not allowed)")
     return value.strip()
+
+
+def script_prog() -> str:
+    # Avoid hardcoding ssrfisher.py/ssrf_server.py in help output
+    base = os.path.basename(sys.argv[0] or "") or "ssrfisher.py"
+    return base
 
 
 # ---------------------------
@@ -371,10 +386,6 @@ class SSRFHandler(BaseHTTPRequestHandler):
         return
 
     def version_string(self) -> str:
-        """
-        Controls the value of the HTTP 'Server:' header (sent by send_response()).
-        If --server is set, it fully replaces the default.
-        """
         custom = getattr(self.server, "server_header", None)
         if custom:
             return custom
@@ -397,6 +408,120 @@ class SSRFHandler(BaseHTTPRequestHandler):
         with self.server.log_file_lock:
             fp.write(json.dumps(entry, ensure_ascii=False) + "\n")
             fp.flush()
+
+    def _emit_cors_headers(self) -> None:
+        if not getattr(self.server, "cors_enabled", False):
+            return
+
+        origin = self.headers.get("Origin")
+        creds_requested = bool(getattr(self.server, "cors_credentials", False))
+        open_mode = bool(getattr(self.server, "cors_open", False))
+        configured_origin = getattr(self.server, "cors_origin", None)  # may be None
+
+        # Browser reality:
+        # - Credentials + '*' is rejected, so we reflect Origin when creds/open is enabled.
+        reflect_origin = False
+        allow_origin: str
+
+        if configured_origin is not None:
+            if configured_origin == "*" and creds_requested:
+                reflect_origin = True
+                allow_origin = "*"
+            else:
+                allow_origin = configured_origin
+        else:
+            reflect_origin = creds_requested or open_mode
+            allow_origin = "*"
+
+        send_creds = creds_requested
+
+        if reflect_origin:
+            if origin:
+                allow_origin = origin
+                self.send_header("Vary", "Origin")
+            else:
+                allow_origin = "*"
+                send_creds = False
+
+        self.send_header("Access-Control-Allow-Origin", allow_origin)
+
+        if send_creds:
+            self.send_header("Access-Control-Allow-Credentials", "true")
+
+        allow_methods = getattr(self.server, "cors_allow_methods", None) or "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
+        self.send_header("Access-Control-Allow-Methods", allow_methods)
+
+        allow_headers = getattr(self.server, "cors_allow_headers", None)
+        if allow_headers is None:
+            req_hdrs = self.headers.get("Access-Control-Request-Headers")
+            allow_headers = req_hdrs if req_hdrs else "Authorization,Content-Type"
+        self.send_header("Access-Control-Allow-Headers", allow_headers)
+
+        expose = getattr(self.server, "cors_expose_headers", None)
+        if expose is not None:
+            self.send_header("Access-Control-Expose-Headers", expose)
+        elif open_mode:
+            self.send_header("Access-Control-Expose-Headers", "*")
+
+        max_age = getattr(self.server, "cors_max_age", None)
+        if max_age is not None:
+            self.send_header("Access-Control-Max-Age", str(max_age))
+
+        if getattr(self.server, "cors_private_network", False):
+            if (self.headers.get("Access-Control-Request-Private-Network") or "").lower() == "true":
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+
+    def _send_response(self, req_id: int, send_body: bool = True) -> dict:
+        code = self.server.response_code
+
+        body_bytes = self.server.response_body
+        file_path = self.server.response_file_path
+        file_size = self.server.response_file_size
+
+        content_type = self.server.content_type
+        location = self.server.location if (is_redirect(code) and self.server.location) else None
+        content_disposition = self.server.content_disposition
+
+        length = file_size if file_path else len(body_bytes or b"")
+
+        self.send_response(code)
+
+        if getattr(self.server, "emit_ssrfisher_headers", True):
+            self.send_header("X-SSRFisher", "1")
+            self.send_header("X-SSRFisher-ReqID", str(req_id))
+
+        self._emit_cors_headers()
+
+        if location:
+            self.send_header("Location", location)
+
+        if content_disposition:
+            self.send_header("Content-Disposition", content_disposition)
+
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+
+        for k, v in self.server.extra_headers:
+            self.send_header(k, v)
+
+        self.end_headers()
+
+        if send_body:
+            if file_path:
+                with open(file_path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            elif body_bytes:
+                self.wfile.write(body_bytes)
+
+        return {
+            "status": code,
+            "location": location,
+            "content_type": content_type,
+            "content_disposition": content_disposition,
+            "content_length": length,
+            "tls": bool(self.server.tls_enabled),
+            "cors": bool(getattr(self.server, "cors_enabled", False)),
+        }
 
     def _console_log(self, req_id: int, req_body: bytes, elapsed_ms: int, resp_meta: dict) -> None:
         if self.server.quiet:
@@ -461,28 +586,52 @@ class SSRFHandler(BaseHTTPRequestHandler):
                 hdr_table.add_row(k, v)
             renderables.append(hdr_table)
 
+        detached_body: tuple[str, str, str] | None = None  # (lang, rendered, label)
+
         if self.server.show_body:
             ct = self.headers.get("Content-Type", "")
-            lang, rendered, truncated = pretty_body(req_body, ct, self.server.log_body_max)
+            maxn = self.server.log_body_max
+            lang, rendered, truncated = pretty_body(req_body, ct, maxn)
+
             if not req_body:
                 renderables.append(Text("(empty body)", style="dim"))
             else:
                 label = f"{len(req_body)} bytes"
                 if ct:
                     label += f" | {ct}"
-                if truncated:
-                    label += f" | truncated (+{len(req_body) - self.server.log_body_max} bytes)"
-                renderables.append(
-                    Panel(
-                        Syntax(rendered, lang, word_wrap=True),
-                        title=f"Body  [{label}]",
-                        title_align="left",
-                        border_style="bright_black",
+                if maxn <= 0:
+                    label += " | unlimited"
+                if truncated and maxn > 0:
+                    label += f" | truncated (+{len(req_body) - maxn} bytes)"
+
+                if getattr(self.server, "detach_body", False):
+                    renderables.append(Text(f"(body printed below for easy copy) [{label}]", style="dim"))
+                    detached_body = (lang, rendered, label)
+                else:
+                    renderables.append(
+                        Panel(
+                            Syntax(rendered, lang, word_wrap=True),
+                            title=f"Body  [{label}]",
+                            title_align="left",
+                            border_style="bright_black",
+                        )
                     )
-                )
 
         with self.server.console_lock:
             console.print(Panel(Group(*renderables), title=title, title_align="left", border_style="blue"))
+
+            if detached_body:
+                _lang, rendered, label = detached_body
+
+                # Use Rich only for separators; print BODY via raw stdout to avoid Rich truncation on huge lines.
+                console.print(Rule(Text(f"Body #{req_id}  [{label}]", style="dim"), style="bright_black"))
+
+                if rendered and not rendered.endswith("\n"):
+                    rendered += "\n"
+                sys.stdout.write(rendered)
+                sys.stdout.flush()
+
+                console.print(Rule(style="bright_black"))
 
             code = resp_meta["status"]
             line = Text.assemble(("→ response ", "dim"), (str(code), status_style(code)))
@@ -506,127 +655,6 @@ class SSRFHandler(BaseHTTPRequestHandler):
 
             console.print(line)
             console.print()
-
-    def _emit_cors_headers(self) -> None:
-        if not getattr(self.server, "cors_enabled", False):
-            return
-
-        origin = self.headers.get("Origin")
-        creds_requested = bool(getattr(self.server, "cors_credentials", False))
-        open_mode = bool(getattr(self.server, "cors_open", False))
-        configured_origin = getattr(self.server, "cors_origin", None)  # may be None
-
-        # Decide behavior
-        # - If credentials are enabled, we should NOT use '*' (browsers reject).
-        # - In open mode: reflect Origin when present; otherwise use '*' and skip credentials header (no CORS context anyway).
-        # - If cors_origin is explicitly '*', handle it safely with the same rule.
-        reflect_origin = False
-        allow_origin: str
-
-        if configured_origin is not None:
-            if configured_origin == "*" and creds_requested:
-                # Avoid invalid '*'+credentials. Prefer reflection.
-                reflect_origin = True
-            else:
-                allow_origin = configured_origin
-        else:
-            # No configured origin
-            reflect_origin = creds_requested or open_mode
-            allow_origin = "*"  # fallback
-
-        send_creds = creds_requested
-
-        if reflect_origin:
-            if origin:
-                allow_origin = origin
-                self.send_header("Vary", "Origin")
-            else:
-                # No Origin header: browsers won't treat it as a CORS response.
-                # Avoid "null" (often blocked/confusing) and avoid invalid '*'+credentials.
-                allow_origin = "*"
-                send_creds = False
-
-        self.send_header("Access-Control-Allow-Origin", allow_origin)
-
-        if send_creds:
-            self.send_header("Access-Control-Allow-Credentials", "true")
-
-        allow_methods = getattr(self.server, "cors_allow_methods", None) or "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD"
-        self.send_header("Access-Control-Allow-Methods", allow_methods)
-
-        allow_headers = getattr(self.server, "cors_allow_headers", None)
-        if allow_headers is None:
-            req_hdrs = self.headers.get("Access-Control-Request-Headers")
-            allow_headers = req_hdrs if req_hdrs else "Authorization,Content-Type"
-        self.send_header("Access-Control-Allow-Headers", allow_headers)
-
-        expose = getattr(self.server, "cors_expose_headers", None)
-        if expose is not None:
-            self.send_header("Access-Control-Expose-Headers", expose)
-        elif open_mode:
-            self.send_header("Access-Control-Expose-Headers", "*")
-
-        max_age = getattr(self.server, "cors_max_age", None)
-        if max_age is not None:
-            self.send_header("Access-Control-Max-Age", str(max_age))
-
-        if getattr(self.server, "cors_private_network", False):
-            if (self.headers.get("Access-Control-Request-Private-Network") or "").lower() == "true":
-                self.send_header("Access-Control-Allow-Private-Network", "true")
-
-    def _send_response(self, req_id: int, send_body: bool = True) -> dict:
-        code = self.server.response_code
-
-        body_bytes = self.server.response_body
-        file_path = self.server.response_file_path
-        file_size = self.server.response_file_size
-
-        content_type = self.server.content_type
-        location = self.server.location if (is_redirect(code) and self.server.location) else None
-        content_disposition = self.server.content_disposition
-
-        length = file_size if file_path else len(body_bytes or b"")
-
-        self.send_response(code)
-
-        # Optional SSRFisher fingerprint headers
-        if getattr(self.server, "emit_ssrfisher_headers", True):
-            self.send_header("X-SSRFisher", "1")
-            self.send_header("X-SSRFisher-ReqID", str(req_id))
-
-        # Optional CORS
-        self._emit_cors_headers()
-
-        if location:
-            self.send_header("Location", location)
-
-        if content_disposition:
-            self.send_header("Content-Disposition", content_disposition)
-
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(length))
-
-        for k, v in self.server.extra_headers:
-            self.send_header(k, v)
-
-        self.end_headers()
-
-        if send_body:
-            if file_path:
-                with open(file_path, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
-            elif body_bytes:
-                self.wfile.write(body_bytes)
-
-        return {
-            "status": code,
-            "location": location,
-            "content_type": content_type,
-            "content_disposition": content_disposition,
-            "content_length": length,
-            "tls": bool(self.server.tls_enabled),
-            "cors": bool(getattr(self.server, "cors_enabled", False)),
-        }
 
     def _handle_any(self, send_body: bool = True) -> None:
         req_id = self._next_req_id()
@@ -670,10 +698,17 @@ class SSRFHandler(BaseHTTPRequestHandler):
 
         if self.server.file_log_body:
             body_len = len(req_body)
-            preview = req_body[: self.server.file_log_body_max]
+            maxn = self.server.file_log_body_max
+            if maxn <= 0:
+                preview = req_body
+                truncated = False
+            else:
+                preview = req_body[:maxn]
+                truncated = body_len > maxn
+
             entry["request"]["body"] = {
                 "length": body_len,
-                "truncated": body_len > self.server.file_log_body_max,
+                "truncated": truncated,
                 "preview_utf8": preview.decode("utf-8", errors="replace"),
                 "preview_b64": base64.b64encode(preview).decode("ascii"),
             }
@@ -694,7 +729,7 @@ class SSRFHandler(BaseHTTPRequestHandler):
 # ---------------------------
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="ssrfisher.py",
+        prog=script_prog(),
         description="SSRFisher is a lightweight HTTP/HTTPS lure server for SSRF testing (CTF & pentest).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,  # Rich by default; plain only when --no-color
@@ -732,7 +767,6 @@ def build_parser() -> argparse.ArgumentParser:
                       help="If using --download-file and no --content-disposition is set, use inline instead of attachment.")
 
     mimic_choices = ", ".join(sorted(MIMIC_PRESETS.keys()))
-
     mimic = ap.add_argument_group("Response fingerprinting / mimicry")
     mimic.add_argument(
         "--no-ssrfisher-headers",
@@ -749,8 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mimic",
         choices=sorted(MIMIC_PRESETS.keys()),
         default=None,
-        help=f"Apply a preset: disables X-SSRFisher headers, sets a realistic Server header and common headers. "
-             f"Choices: {mimic_choices}."
+        help=f"Apply a preset ({mimic_choices}). Implies: disable X-SSRFisher headers, set a realistic Server header, and add common headers."
     )
 
     cors = ap.add_argument_group("CORS")
@@ -803,7 +836,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     ui = ap.add_argument_group("Console output")
     ui.add_argument("--log-body-max", type=int, default=4096,
-                    help="Max request body bytes displayed in console (default: 4096).")
+                    help="Max request body bytes displayed in console (default: 4096). Use 0 for unlimited.")
+    ui.add_argument("--detach-body", action="store_true",
+                    help="Print request bodies below the main request panel (copy-friendly, no borders).")
     ui.add_argument("--no-color", action="store_true",
                     help="Disable colored console output (also switches help to plain argparse output).")
     ui.add_argument("--no-headers", action="store_true", help="Do not display request headers in console.")
@@ -819,7 +854,7 @@ def build_parser() -> argparse.ArgumentParser:
     logg.add_argument("--file-log-body", action="store_true",
                       help="Include request body preview in JSONL logs (UTF-8 + base64).")
     logg.add_argument("--file-log-body-max", type=int, default=8192,
-                      help="Max request body bytes stored in JSONL logs (default: 8192).")
+                      help="Max request body bytes stored in JSONL logs (default: 8192). Use 0 for unlimited.")
 
     tls = ap.add_argument_group("TLS / HTTPS")
     tls.add_argument("--ssl", nargs="?", const="auto", default=None,
@@ -857,6 +892,11 @@ def print_rich_help(console: Console, parser: argparse.ArgumentParser) -> None:
     console.print(
         "[bold]SSRFisher[/bold] is a lightweight [cyan]HTTP/HTTPS lure server[/cyan] for SSRF testing (CTF & pentest).\n"
         "Control status codes, redirects, response bodies, file downloads, and log every request.\n"
+        "\n"
+        "[dim]Notes:[/dim]\n"
+        "• Use [bold]--log-body-max 0[/bold] for unlimited console body preview.\n"
+        "• Use [bold]--file-log-body-max 0[/bold] for unlimited JSONL body preview.\n"
+        "• Use [bold]--detach-body[/bold] to print bodies below the panel (copy-friendly).\n"
     )
 
     usage = parser.format_usage().strip()
@@ -877,13 +917,15 @@ def print_rich_help(console: Console, parser: argparse.ArgumentParser) -> None:
         console.print(Panel(table, title=grp.title, title_align="left", border_style="blue"))
 
     examples = [
-        ("Basic HTTP lure (200 OK)", 'python ssrfisher.py --port 8000 --code 200 --body "OK"'),
-        ("Redirect (3xx) with Location", 'python ssrfisher.py --bind 0.0.0.0 --port 80 --code 302 --location "http://127.0.0.1/admin"'),
-        ("Serve a local file as a download (streamed)", r'python ssrfisher.py --port 8000 --code 200 --download-file "C:\tmp\poc.png"'),
-        ("JSONL logging", r"python ssrfisher.py --port 8000 --log-file .\ssrfisher.jsonl --file-log-headers --file-log-body"),
-        ("Mimic IIS (stealth headers + realistic Server)", r"python ssrfisher.py --port 8000 --mimic iis"),
-        ("Open CORS (credentials + Origin reflection)", r"python ssrfisher.py --port 8000 --cors-open"),
-        ("HTTPS auto-signed (recommended: pip install cryptography)", "python ssrfisher.py --bind 0.0.0.0 --port 443 --ssl"),
+        ("Basic HTTP lure (200 OK)", f'python {script_prog()} --port 8000 --code 200 --body "OK"'),
+        ("Redirect (3xx) with Location", f'python {script_prog()} --bind 0.0.0.0 --port 80 --code 302 --location "http://127.0.0.1/admin"'),
+        ("Serve a local file as a download (streamed)", f'python {script_prog()} --port 8000 --code 200 --download-file "C:\\tmp\\poc.png"'),
+        ("JSONL logging", f"python {script_prog()} --port 8000 --log-file .\\ssrfisher.jsonl --file-log-headers --file-log-body"),
+        ("Unlimited console body (copy-friendly)", f"python {script_prog()} --port 8000 --log-body-max 0 --detach-body"),
+        ("Unlimited JSONL body (use with care)", f"python {script_prog()} --port 8000 --log-file .\\ssrfisher.jsonl --file-log-body --file-log-body-max 0"),
+        ("Mimic IIS (stealth headers + realistic Server)", f"python {script_prog()} --port 8000 --mimic iis"),
+        ("Open CORS (credentials + Origin reflection)", f"python {script_prog()} --port 8000 --cors-open"),
+        ("HTTPS auto-signed (recommended: pip install cryptography)", f"python {script_prog()} --bind 0.0.0.0 --port 443 --ssl"),
     ]
 
     ex_text = Text()
@@ -1004,7 +1046,6 @@ def main() -> None:
 
     httpd.cors_enabled = cors_enabled
     httpd.cors_open = bool(args.cors_open)
-    # Open mode implies credentials unless user explicitly did not set it
     httpd.cors_credentials = bool(args.cors_credentials or args.cors_open)
     httpd.cors_origin = args.cors_origin
     httpd.cors_allow_methods = args.cors_allow_methods
@@ -1014,6 +1055,7 @@ def main() -> None:
     httpd.cors_private_network = bool(args.cors_private_network)
 
     httpd.log_body_max = args.log_body_max
+    httpd.detach_body = bool(args.detach_body)
     httpd.show_headers = not args.no_headers
     httpd.show_body = not args.no_body
     httpd.quiet = args.quiet
@@ -1075,6 +1117,10 @@ def main() -> None:
             info.add_row("CORS creds", "ON" if httpd.cors_credentials else "OFF")
             info.add_row("CORS origin", httpd.cors_origin or ("reflect" if httpd.cors_credentials else "*"))
 
+        info.add_row("Detach body", "ON" if httpd.detach_body else "OFF")
+        info.add_row("Console max body", "unlimited" if args.log_body_max <= 0 else str(args.log_body_max))
+        info.add_row("JSONL max body", "unlimited" if args.file_log_body_max <= 0 else str(args.file_log_body_max))
+
         if args.location and is_redirect(args.code):
             info.add_row("Location", f"[bold cyan]{args.location}[/bold cyan]")
 
@@ -1101,7 +1147,6 @@ def main() -> None:
         info.add_row("Stop", "CTRL+C")
         console.print(Panel(info, border_style="green"))
 
-        # Smart tip only when relevant
         if tls_enabled and args.ssl == "auto" and tls_details.get("backend") == "openssl":
             console.print("[yellow]Tip:[/yellow] For clean auto-signed cert generation, install cryptography: [bold]pip install cryptography[/bold]\n")
 
