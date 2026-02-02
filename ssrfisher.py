@@ -11,6 +11,7 @@
 # - Mimic real servers + optional open CORS
 # - Copy-friendly body output (--detach-body) (prints raw to stdout, no Rich truncation)
 # - Unlimited body preview with 0 (console + JSONL)
+# - Reload --body-file / --download-file on every request (live edits)
 
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency: rich\nInstall with: pip install rich\n")
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 SLOGAN = "Hook requests. Reel logs."
 AUTHOR_TAG = "@Gromak123"
 
@@ -64,6 +65,17 @@ METHOD_STYLE = {
     "PATCH": "bold magenta",
     "DELETE": "bold red",
     "OPTIONS": "bold yellow",
+}
+
+# Border color by method (keeps the layout clean, but more "pro")
+METHOD_BORDER = {
+    "GET": "cyan",
+    "HEAD": "cyan",
+    "POST": "magenta",
+    "PUT": "magenta",
+    "PATCH": "magenta",
+    "DELETE": "red",
+    "OPTIONS": "yellow",
 }
 
 # Mimic presets (simple + plausible)
@@ -99,6 +111,11 @@ MIMIC_PRESETS: dict[str, dict] = {
 # ---------------------------
 def now_iso() -> str:
     return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+def now_display() -> str:
+    # Better readability for console titles
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def status_style(code: int) -> str:
@@ -418,8 +435,6 @@ class SSRFHandler(BaseHTTPRequestHandler):
         open_mode = bool(getattr(self.server, "cors_open", False))
         configured_origin = getattr(self.server, "cors_origin", None)  # may be None
 
-        # Browser reality:
-        # - Credentials + '*' is rejected, so we reflect Origin when creds/open is enabled.
         reflect_origin = False
         allow_origin: str
 
@@ -474,9 +489,28 @@ class SSRFHandler(BaseHTTPRequestHandler):
     def _send_response(self, req_id: int, send_body: bool = True) -> dict:
         code = self.server.response_code
 
+        # Live file reload:
+        response_body_file_path = getattr(self.server, "response_body_file_path", None)
+        response_download_file_path = getattr(self.server, "response_download_file_path", None)
+
+        # Static response
         body_bytes = self.server.response_body
-        file_path = self.server.response_file_path
-        file_size = self.server.response_file_size
+
+        file_path = None
+        file_size = 0
+
+        if response_download_file_path:
+            file_path = response_download_file_path
+            try:
+                file_size = os.path.getsize(file_path)
+            except Exception:
+                file_size = 0
+        elif response_body_file_path:
+            try:
+                with open(response_body_file_path, "rb") as f:
+                    body_bytes = f.read()
+            except Exception:
+                body_bytes = b""
 
         content_type = self.server.content_type
         location = self.server.location if (is_redirect(code) and self.server.location) else None
@@ -508,8 +542,11 @@ class SSRFHandler(BaseHTTPRequestHandler):
 
         if send_body:
             if file_path:
-                with open(file_path, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
+                try:
+                    with open(file_path, "rb") as f:
+                        shutil.copyfileobj(f, self.wfile)
+                except Exception:
+                    pass
             elif body_bytes:
                 self.wfile.write(body_bytes)
 
@@ -536,18 +573,20 @@ class SSRFHandler(BaseHTTPRequestHandler):
         client_ip, client_port = self.client_address
         method = self.command.upper()
 
-        title = Text.assemble(
-            ("#", "dim"),
-            (str(req_id), "bold white"),
-            ("  ", "dim"),
-            (now_iso(), "dim"),
-            ("  ", "dim"),
-            (f"{client_ip}:{client_port}", "dim"),
-            ("  ", "dim"),
-            (method, METHOD_STYLE.get(method, "bold white")),
-            (" ", "dim"),
-            (path_only, "bold white"),
-        )
+        # Pro title: clean + readable + not overloaded
+        title = Text()
+        title.append(f" #{req_id} ", style="bold white on bright_black")
+        title.append(" ")
+        title.append(now_display(), style="bold bright_white")
+        title.append("  ")
+        title.append("from ", style="dim")
+        title.append("[", style="dim")
+        title.append(f"{client_ip}:{client_port}", style="bold bright_green")
+        title.append("]", style="dim")
+        title.append("  ")
+        title.append(method, style=METHOD_STYLE.get(method, "bold white"))
+        title.append(" ")
+        title.append(path_only, style="bold white")
         if query:
             title.append("  ?" + query, style="dim")
 
@@ -618,12 +657,12 @@ class SSRFHandler(BaseHTTPRequestHandler):
                     )
 
         with self.server.console_lock:
-            console.print(Panel(Group(*renderables), title=title, title_align="left", border_style="blue"))
+            border = METHOD_BORDER.get(method, "blue")
+            console.print(Panel(Group(*renderables), title=title, title_align="left", border_style=border))
 
             if detached_body:
                 _lang, rendered, label = detached_body
 
-                # Use Rich only for separators; print BODY via raw stdout to avoid Rich truncation on huge lines.
                 console.print(Rule(Text(f"Body #{req_id}  [{label}]", style="dim"), style="bright_black"))
 
                 if rendered and not rendered.endswith("\n"):
@@ -753,9 +792,9 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--body", "-b", default=None,
                      help="Response body as text (UTF-8). If no body/file is provided, defaults to 'OK\\n'.")
     src.add_argument("--body-file", default=None,
-                     help="Path to a local file to use as the response body (fully loaded in memory).")
+                     help="Path to a local file to use as the response body (reloaded on every request).")
     src.add_argument("--download-file", default=None,
-                     help="Path to a local file to stream as the response body (recommended for large files).")
+                     help="Path to a local file to stream as the response body (re-opened on every request).")
 
     resp.add_argument("--content-type", default=None,
                       help="Override Content-Type. If omitted, guessed from file extension for file responses, else text/plain.")
@@ -980,21 +1019,19 @@ def main() -> None:
     if args.body is None and not args.body_file and not args.download_file:
         args.body = "OK\n"
 
-    # Build response payload
+    # Response sources
     response_body: bytes | None = None
-    response_file_path: str | None = None
-    response_file_size = 0
+    response_body_file_path: str | None = None
+    response_download_file_path: str | None = None
 
     if args.download_file:
-        response_file_path = args.download_file
-        if not os.path.isfile(response_file_path):
-            raise SystemExit(f"--download-file: file not found: {response_file_path}")
-        response_file_size = os.path.getsize(response_file_path)
+        response_download_file_path = args.download_file
+        if not os.path.isfile(response_download_file_path):
+            raise SystemExit(f"--download-file: file not found: {response_download_file_path}")
     elif args.body_file:
-        if not os.path.isfile(args.body_file):
-            raise SystemExit(f"--body-file: file not found: {args.body_file}")
-        with open(args.body_file, "rb") as f:
-            response_body = f.read()
+        response_body_file_path = args.body_file
+        if not os.path.isfile(response_body_file_path):
+            raise SystemExit(f"--body-file: file not found: {response_body_file_path}")
     else:
         response_body = (args.body or "").encode("utf-8", errors="replace")
 
@@ -1002,8 +1039,8 @@ def main() -> None:
     if args.content_type:
         content_type = args.content_type
     else:
-        if response_file_path or args.body_file:
-            path = response_file_path or args.body_file
+        if response_download_file_path or response_body_file_path:
+            path = response_download_file_path or response_body_file_path
             guessed, _ = mimetypes.guess_type(path)
             content_type = guessed or "application/octet-stream"
         else:
@@ -1011,8 +1048,8 @@ def main() -> None:
 
     # Content-Disposition
     content_disposition = args.content_disposition
-    if not content_disposition and response_file_path:
-        fname = args.download_name or os.path.basename(response_file_path)
+    if not content_disposition and response_download_file_path:
+        fname = args.download_name or os.path.basename(response_download_file_path)
         mode = "inline" if args.inline else "attachment"
         content_disposition = f'{mode}; filename="{fname}"'
 
@@ -1034,9 +1071,11 @@ def main() -> None:
     # Server config
     httpd.response_code = args.code
     httpd.location = args.location
+
     httpd.response_body = response_body
-    httpd.response_file_path = response_file_path
-    httpd.response_file_size = response_file_size
+    httpd.response_body_file_path = response_body_file_path
+    httpd.response_download_file_path = response_download_file_path
+
     httpd.content_type = content_type
     httpd.content_disposition = content_disposition
     httpd.extra_headers = extra_headers
@@ -1129,8 +1168,16 @@ def main() -> None:
 
         info.add_row("Content-Type", content_type)
 
-        if response_file_path:
-            info.add_row("Response", f"{response_file_size} bytes (streamed file: {response_file_path})")
+        if response_download_file_path:
+            try:
+                info.add_row("Response", f"{os.path.getsize(response_download_file_path)} bytes (streamed file: {response_download_file_path})")
+            except Exception:
+                info.add_row("Response", f"(streamed file: {response_download_file_path})")
+        elif response_body_file_path:
+            try:
+                info.add_row("Response", f"{os.path.getsize(response_body_file_path)} bytes (body-file: {response_body_file_path})")
+            except Exception:
+                info.add_row("Response", f"(body-file: {response_body_file_path})")
         else:
             info.add_row("Response", f"{len(response_body or b'')} bytes")
 
